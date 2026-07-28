@@ -339,20 +339,20 @@ class Picnic extends Homey.App {
 							// on the counter, and the van is often early
 							this.cancelDeliverySchedule()
 
-							this._groceriesDelivered.trigger()
+							// the delivery this trigger is about, so a flow does not
+							// have to read the global tokens to know what arrived
+							const data = Object.assign(
+								this._etaTokens(this.homey.settings.get("delivery_eta_start"), this.homey.settings.get("delivery_eta_end")),
+								{ 'delivery_time': this.formatEtaTime(orderEvent["delivery_time"]) }
+							)
 
-							this.orderStatus.setValue("groceries_delivered")
-							this.orderPrice.setValue(0)
-							this.orderDeliveryDate.setValue("")
-							this.orderDeliveryStartWindow.setValue("")
-							this.orderDeliveryEndWindow.setValue("")
+							await this._groceriesDelivered.trigger(data)
+
+							await this.orderStatus.setValue("groceries_delivered")
 
 							this.homey.app.changeInterval(DEFAULT_POLL_INTERVAL);
 
 							this.homey.settings.set("order_status", "groceries_delivered")
-							this.homey.settings.unset("delivery_date")
-							this.homey.settings.unset("delivery_eta_start")
-							this.homey.settings.unset("delivery_eta_end")
 						}
 					}
 				})
