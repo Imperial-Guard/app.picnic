@@ -44,6 +44,8 @@ class Picnic extends Homey.App {
 
 		this.utils = new utils({ homey: this.homey });
 
+		this._deliveryJobs = [];
+
 		this.homey.settings.set("additemLock", false)
 
 		// simulate fresh install
@@ -83,6 +85,12 @@ class Picnic extends Homey.App {
 			this.debug("Auth found, retrieving order")
 			this.pollOrder();
 		}
+	}
+
+	async onUninit() {
+		this.debug("Picnic is stopping, cleaning up the timers")
+		this.cancelDeliverySchedule();
+		clearInterval(runningInterval);
 	}
 
 	async _initAppTokens() {
@@ -182,13 +190,17 @@ class Picnic extends Homey.App {
 		else if (this.homey.settings.get("order_status") == "delivery_announced") {
 			this.debug("Order announced")
 
-			if (this.homey.settings.getKeys().indexOf("delivery_eta_start") != -1) {
-				this.debug("30 minutes before delivery we will increase polling interval");
-				this.homey.app.createDeliverySchedule(this.homey.settings.get("delivery_eta_start"), this.homey.settings.get("delivery_eta_end"));
-			}
+			const settingKeys = this.homey.settings.getKeys();
 
-			this.debug("Until delivery time, using ORDERED interval");
-			this.homey.app.changeInterval(ORDERED_POLL_INTERVAL);
+			// without both ends of the window new Date(null) would schedule for
+			// 1 jan 1970, so check for the end as well as the start
+			if (settingKeys.indexOf("delivery_eta_start") != -1 && settingKeys.indexOf("delivery_eta_end") != -1) {
+				this.debug("Rescheduling the jobs for the delivery window we know about");
+				this.homey.app.createDeliverySchedule(this.homey.settings.get("delivery_eta_start"), this.homey.settings.get("delivery_eta_end"));
+			} else {
+				this.debug("No delivery window stored, using ORDERED interval");
+				this.homey.app.changeInterval(ORDERED_POLL_INTERVAL);
+			}
 		}
 		else if (this.homey.settings.get("order_status") == "groceries_delivered") {
 			this.debug("No order found, updating poll interval")
@@ -289,15 +301,15 @@ class Picnic extends Homey.App {
 							this.homey.settings.set("delivery_eta_end", orderEvent["eta2_end"])
 							this.homey.settings.set("delivery_date", tokens["eta_date"])
 
-							this.debug("30 minutes before delivery we will increase polling interval");
+							// takes care of the poll interval for this window as well
 							this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
-
-							this.debug("Until that time, using ORDERED interval");
-							this.homey.app.changeInterval(ORDERED_POLL_INTERVAL);
-
 						}
 						else if (orderEvent["event"] == 'groceries_delivered') {
 							this.debug("Order changed to groceries_delivered, firing trigger")
+
+							// the window triggers are pointless once the crate is
+							// on the counter, and the van is often early
+							this.cancelDeliverySchedule()
 
 							this._groceriesDelivered.trigger()
 
@@ -350,23 +362,76 @@ class Picnic extends Homey.App {
 		runningInterval = setInterval(this.pollOrder.bind(this), interval);
 	}
 
-	createDeliverySchedule(eta_start, eta_end) {
-		const deliveryStartMin30 = new Date(new Date(eta_start) - 1000 * 60 * 30);
-		this.debug("Increasing poll rate at " + deliveryStartMin30.toString())
+	// node-schedule returns null for a moment that already passed, which happens
+	// on an app update or reboot halfway through the delivery window. Say so
+	// instead of pretending the job was planned.
+	_scheduleJob(runAt, description, callback) {
+		// an invalid date is not refused but read as a recurring spec, which
+		// would fire the job every minute rather than never
+		if (isNaN(runAt.getTime())) {
+			this.debug("Not scheduling " + description + ", the moment to run it at is unknown");
+			return null;
+		}
 
-		// scheduling increase of the polling rate 30min before the delivery time 
-		schedule.scheduleJob(deliveryStartMin30, () => {
-			this.homey.app.changeInterval(DELIVERY_POLL_INTERVAL);
-		});
+		const job = schedule.scheduleJob(runAt, callback);
+
+		if (job === null) {
+			this.debug("Not scheduling " + description + ", " + runAt.toString() + " has already passed");
+			return null;
+		}
+
+		this.debug("Scheduled " + description + " at " + runAt.toString());
+		this._deliveryJobs.push(job);
+		return job;
+	}
+
+	cancelDeliverySchedule() {
+		if (this._deliveryJobs == undefined) this._deliveryJobs = [];
+		if (this._deliveryJobs.length == 0) return;
+
+		this.debug("Cancelling " + this._deliveryJobs.length + " scheduled delivery job(s)");
+		this._deliveryJobs.forEach(job => job.cancel());
+		this._deliveryJobs = [];
+	}
+
+	createDeliverySchedule(eta_start, eta_end) {
+		// planning is always for the one window we know about, so start over
+		this.cancelDeliverySchedule();
+
+		const deliveryStart = new Date(eta_start);
+		const deliveryEnd = new Date(eta_end);
+
+		if (isNaN(deliveryStart.getTime()) || isNaN(deliveryEnd.getTime())) {
+			this.debug("Not scheduling anything, the delivery window is unknown (start: " + eta_start + ", end: " + eta_end + ")");
+			this.changeInterval(ORDERED_POLL_INTERVAL);
+			return;
+		}
+
+		const now = new Date();
+		const deliveryStartMin30 = new Date(deliveryStart.getTime() - 1000 * 60 * 30);
+
+		// scheduling increase of the polling rate 30min before the delivery time
+		if (this._scheduleJob(deliveryStartMin30, "the poll rate increase", () => {
+			this.changeInterval(DELIVERY_POLL_INTERVAL);
+		})) {
+			this.debug("Until that time, using ORDERED interval");
+			this.changeInterval(ORDERED_POLL_INTERVAL);
+		} else if (deliveryEnd > now) {
+			this.debug("Already within 30 minutes of the delivery window, increasing the poll rate right away");
+			this.changeInterval(DELIVERY_POLL_INTERVAL);
+		} else {
+			this.debug("The delivery window has passed, using ORDERED interval until Picnic confirms the delivery");
+			this.changeInterval(ORDERED_POLL_INTERVAL);
+		}
 
 		// schedule beginning of delivery window trigger
-		schedule.scheduleJob(new Date(eta_start), () => {
-			this.homey.app._deliveryAnnouncedTriggerBeginTime.trigger()
+		this._scheduleJob(deliveryStart, "the start of the delivery window trigger", () => {
+			this._deliveryAnnouncedTriggerBeginTime.trigger()
 		});
 
 		// schedule ending of delivery window trigger
-		schedule.scheduleJob(new Date(eta_end), () => {
-			this.homey.app._deliveryAnnouncedTriggerEndTime.trigger()
+		this._scheduleJob(deliveryEnd, "the end of the delivery window trigger", () => {
+			this._deliveryAnnouncedTriggerEndTime.trigger()
 		});
 	}
 
