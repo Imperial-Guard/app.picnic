@@ -4,6 +4,7 @@ const Homey = require('homey');
 const actions = require('./lib/actions.js');
 const conditions = require('./lib/conditions.js')
 const utils = require('./lib/utils.js');
+const { deriveOrderEvent } = require('./lib/orderevent.js');
 
 var http = require("https");
 var md5 = require("md5");
@@ -212,8 +213,12 @@ class Picnic extends Homey.App {
 		return new Promise((resolve, reject) => {
 			if (this.homey.settings.getKeys().indexOf("x-picnic-auth") > -1 && this.homey.settings.getKeys().indexOf("username") > -1 && this.homey.settings.getKeys().indexOf("password") > -1) {
 				this.debug("Polling for new order info")
-				this.getOrderStatus().then(orderEvent => {
+				this.getOrderStatus().then(async orderEvent => {
 					this.debug("Processing order info")
+					if (orderEvent == null) {
+						this.debug("Nothing to do, the order status did not change")
+						return
+					}
 					if (orderEvent.toString() == "Error: unauthorized") {
 						this.debug("Error: unauthorized, please check your credentials")
 						this.login(this.homey.settings.get('username'), this.homey.settings.get('password'), function (callBack) {
@@ -595,34 +600,26 @@ class Picnic extends Homey.App {
 				}
 				if (typeof content == 'undefined') return reject("No content received");
 
-				if (JSON.parse(content)[0] != undefined) {
-					if (JSON.parse(content)[0]["delivery_time"] != undefined && this.homey.settings.get("order_status") != "groceries_delivered") {
-						this.debug("Retrieved new order status from Picnic: groceries_delivered, old order status was: " + this.homey.settings.get("order_status"))
-						return resolve({ "event": "groceries_delivered" })
-					}
-					else if (JSON.parse(content)[0]["delivery_time"] == undefined && JSON.parse(content)[0]["eta2"] != undefined && this.homey.settings.get("order_status") != "delivery_announced") {
-						this.debug("Retrieved new order status from Picnic: delivery_announced, old order status was: " + this.homey.settings.get("order_status"))
-						return resolve({ "event": "delivery_announced", "eta2_start": JSON.parse(content)[0]["eta2"]["start"], "eta2_end": JSON.parse(content)[0]["eta2"]["end"] })
+				var summary;
+				try {
+					summary = JSON.parse(content);
+				} catch (exception) {
+					return reject("Order info could not be parsed");
+				}
 
-					}
-					else if (JSON.parse(content)[0]["delivery_time"] == undefined && JSON.parse(content)[0]["eta2"] == undefined && this.homey.settings.get("order_status") != "groceries_ordered") {
-						this.debug("Retrieved new order status from Picnic: groceries_ordered, old order status was: " + this.homey.settings.get("order_status"))
-						var total_amount = 0;
-						JSON.parse(content)[0]["orders"].forEach(function (order) { total_amount = total_amount + order["total_price"] });
-						return resolve({ "event": "groceries_ordered", "price": total_amount / 100, "eta1_start": JSON.parse(content)[0]["slot"]["window_start"], "eta1_end": JSON.parse(content)[0]["slot"]["window_end"] })
-					}
-					else {
-						this.debug("Order status did not change, current order status: " + this.homey.settings.get("order_status"))
-					}
+				const previousStatus = this.homey.settings.get("order_status")
+				const orderEvent = deriveOrderEvent(summary, previousStatus, {
+					"start": this.homey.settings.get("delivery_eta_start"),
+					"end": this.homey.settings.get("delivery_eta_end")
+				});
+
+				if (orderEvent == null) {
+					this.debug("Order status did not change, current order status: " + previousStatus)
+					return resolve(null)
 				}
-				else if (JSON.parse(content).length == 0 && this.homey.settings.get("order_status") != "groceries_delivered" && this.homey.settings.get("order_status") != undefined) {
-					this.debug("No order found, considering this as delivered. Old order status was: " + this.homey.settings.get("order_status"))
-					return resolve({ "event": "groceries_delivered" })
-				}
-				else if (JSON.parse(content).length == 0 && this.homey.settings.get("order_status") != "groceries_delivered" && this.homey.settings.getKeys().indexOf("order_status") == -1) {
-					this.debug("No order found, considering this as delivered. Old order status was: " + this.homey.settings.get("order_status"))
-					return resolve({ "event": "groceries_delivered" })
-				}
+
+				this.debug("Retrieved new order status from Picnic: " + orderEvent["event"] + ", old order status was: " + previousStatus)
+				return resolve(orderEvent)
 			})
 				.catch(error => {
 					this.debug("ERROR: Order retrieval failed")
