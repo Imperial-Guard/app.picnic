@@ -304,6 +304,24 @@ class Picnic extends Homey.App {
 							// takes care of the poll interval for this window as well
 							this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
 						}
+						else if (orderEvent["event"] == 'delivery_eta_updated') {
+							this.debug("Picnic moved the delivery window, updating the tokens and rescheduling")
+
+							const tokens = this._etaTokens(orderEvent["eta2_start"], orderEvent["eta2_end"])
+
+							this.orderDeliveryDate.setValue(tokens["eta_date"])
+							this.orderDeliveryStartWindow.setValue(tokens["eta_start"])
+							this.orderDeliveryEndWindow.setValue(tokens["eta_end"])
+
+							this.homey.settings.set("delivery_eta_start", orderEvent["eta2_start"])
+							this.homey.settings.set("delivery_eta_end", orderEvent["eta2_end"])
+							this.homey.settings.set("delivery_date", tokens["eta_date"])
+
+							// deliberately no delivery_announced trigger: the
+							// announcement already happened and firing it again
+							// would notify everyone twice
+							this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
+						}
 						else if (orderEvent["event"] == 'groceries_delivered') {
 							this.debug("Order changed to groceries_delivered, firing trigger")
 
