@@ -44,7 +44,8 @@ class Picnic extends Homey.App {
 
 		this.utils = new utils({ homey: this.homey });
 
-		this._deliveryJobs = [];
+		this._deliveryWindowJobs = [];
+		this._deliverySoonJobs = [];
 
 		this.homey.settings.set("additemLock", false)
 
@@ -168,6 +169,15 @@ class Picnic extends Homey.App {
 			.getTriggerCard('delivery_announced')
 			.registerRunListener();
 
+		this._deliverySoonTrigger = this.homey.flow
+			.getTriggerCard('delivery_soon')
+			.registerRunListener((args, state) => args.minutes === state.minutes);
+
+		// fired when a flow using this card is saved
+		this._deliverySoonTrigger.on('update', () => {
+			this.rescheduleDeliverySoon().catch(error => this.homey.error(error));
+		});
+
 		this._groceriesDelivered = this.homey.flow
 			.getTriggerCard('groceries_delivered')
 			.registerRunListener();
@@ -196,7 +206,7 @@ class Picnic extends Homey.App {
 			// 1 jan 1970, so check for the end as well as the start
 			if (settingKeys.indexOf("delivery_eta_start") != -1 && settingKeys.indexOf("delivery_eta_end") != -1) {
 				this.debug("Rescheduling the jobs for the delivery window we know about");
-				this.homey.app.createDeliverySchedule(this.homey.settings.get("delivery_eta_start"), this.homey.settings.get("delivery_eta_end"));
+				await this.homey.app.createDeliverySchedule(this.homey.settings.get("delivery_eta_start"), this.homey.settings.get("delivery_eta_end"));
 			} else {
 				this.debug("No delivery window stored, using ORDERED interval");
 				this.homey.app.changeInterval(ORDERED_POLL_INTERVAL);
@@ -302,7 +312,7 @@ class Picnic extends Homey.App {
 							this.homey.settings.set("delivery_date", tokens["eta_date"])
 
 							// takes care of the poll interval for this window as well
-							this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
+							await this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
 						}
 						else if (orderEvent["event"] == 'delivery_eta_updated') {
 							this.debug("Picnic moved the delivery window, updating the tokens and rescheduling")
@@ -320,7 +330,7 @@ class Picnic extends Homey.App {
 							// deliberately no delivery_announced trigger: the
 							// announcement already happened and firing it again
 							// would notify everyone twice
-							this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
+							await this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
 						}
 						else if (orderEvent["event"] == 'groceries_delivered') {
 							this.debug("Order changed to groceries_delivered, firing trigger")
@@ -383,7 +393,7 @@ class Picnic extends Homey.App {
 	// node-schedule returns null for a moment that already passed, which happens
 	// on an app update or reboot halfway through the delivery window. Say so
 	// instead of pretending the job was planned.
-	_scheduleJob(runAt, description, callback) {
+	_scheduleJob(runAt, description, callback, jobs) {
 		// an invalid date is not refused but read as a recurring spec, which
 		// would fire the job every minute rather than never
 		if (isNaN(runAt.getTime())) {
@@ -399,20 +409,71 @@ class Picnic extends Homey.App {
 		}
 
 		this.debug("Scheduled " + description + " at " + runAt.toString());
-		this._deliveryJobs.push(job);
+		jobs.push(job);
 		return job;
 	}
 
-	cancelDeliverySchedule() {
-		if (this._deliveryJobs == undefined) this._deliveryJobs = [];
-		if (this._deliveryJobs.length == 0) return;
+	_cancelJobs(jobs, description) {
+		if (jobs.length == 0) return;
 
-		this.debug("Cancelling " + this._deliveryJobs.length + " scheduled delivery job(s)");
-		this._deliveryJobs.forEach(job => job.cancel());
-		this._deliveryJobs = [];
+		this.debug("Cancelling " + jobs.length + " scheduled " + description + " job(s)");
+		jobs.forEach(job => job.cancel());
+		jobs.length = 0;
 	}
 
-	createDeliverySchedule(eta_start, eta_end) {
+	cancelDeliverySchedule() {
+		this._cancelJobs(this._deliveryWindowJobs, "delivery window");
+		this._cancelJobs(this._deliverySoonJobs, "delivered soon");
+	}
+
+	// one job per unique head start, the run listener sorts out which flow gets it
+	async _createDeliverySoonSchedule(deliveryStart, eta_start, eta_end) {
+		this._cancelJobs(this._deliverySoonJobs, "delivered soon");
+
+		var argumentValues = [];
+
+		try {
+			argumentValues = await this._deliverySoonTrigger.getArgumentValues();
+		} catch (exception) {
+			this.homey.error(exception);
+			return;
+		}
+
+		const minutesUpfront = [...new Set(argumentValues.map(args => args["minutes"]))];
+
+		minutesUpfront.forEach(minutes => {
+			const runAt = new Date(deliveryStart.getTime() - 1000 * 60 * minutes);
+
+			// an announcement can arrive later than the configured head start,
+			// in which case there is nothing left to warn about
+			this._scheduleJob(runAt, "the delivered soon trigger, " + minutes + " minutes upfront", () => {
+				this._deliverySoonTrigger.trigger(this._etaTokens(eta_start, eta_end), { 'minutes': minutes })
+			}, this._deliverySoonJobs);
+		});
+	}
+
+	// argument values only mean something at planning time, so a flow built or
+	// changed after the announcement needs its job planned after the fact
+	async rescheduleDeliverySoon() {
+		if (this.homey.settings.get("order_status") != "delivery_announced") {
+			this.debug("A delivered soon flow changed, but there is no announced delivery to plan for");
+			return;
+		}
+
+		const eta_start = this.homey.settings.get("delivery_eta_start");
+		const eta_end = this.homey.settings.get("delivery_eta_end");
+		const deliveryStart = new Date(eta_start);
+
+		if (isNaN(deliveryStart.getTime())) {
+			this.debug("A delivered soon flow changed, but the delivery window is unknown");
+			return;
+		}
+
+		this.debug("A delivered soon flow changed, replanning against the known delivery window");
+		await this._createDeliverySoonSchedule(deliveryStart, eta_start, eta_end);
+	}
+
+	async createDeliverySchedule(eta_start, eta_end) {
 		// planning is always for the one window we know about, so start over
 		this.cancelDeliverySchedule();
 
@@ -431,7 +492,7 @@ class Picnic extends Homey.App {
 		// scheduling increase of the polling rate 30min before the delivery time
 		if (this._scheduleJob(deliveryStartMin30, "the poll rate increase", () => {
 			this.changeInterval(DELIVERY_POLL_INTERVAL);
-		})) {
+		}, this._deliveryWindowJobs)) {
 			this.debug("Until that time, using ORDERED interval");
 			this.changeInterval(ORDERED_POLL_INTERVAL);
 		} else if (deliveryEnd > now) {
@@ -444,13 +505,15 @@ class Picnic extends Homey.App {
 
 		// schedule beginning of delivery window trigger
 		this._scheduleJob(deliveryStart, "the start of the delivery window trigger", () => {
-			this._deliveryAnnouncedTriggerBeginTime.trigger()
-		});
+			this._deliveryAnnouncedTriggerBeginTime.trigger(this._etaTokens(eta_start, eta_end))
+		}, this._deliveryWindowJobs);
 
 		// schedule ending of delivery window trigger
 		this._scheduleJob(deliveryEnd, "the end of the delivery window trigger", () => {
-			this._deliveryAnnouncedTriggerEndTime.trigger()
-		});
+			this._deliveryAnnouncedTriggerEndTime.trigger(this._etaTokens(eta_start, eta_end))
+		}, this._deliveryWindowJobs);
+
+		await this._createDeliverySoonSchedule(deliveryStart, eta_start, eta_end);
 	}
 
 	async setCountry(country) {

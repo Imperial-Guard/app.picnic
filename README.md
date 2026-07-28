@@ -16,13 +16,17 @@ Polling the status of your Picnic account and providing trigger flowcards based 
   - eta date
   - eta begin, returning the begin of the 60 minutes delivery timeframe
   - eta end, returning the end of the 60 minutes delivery timeframe
-- Your groceries will be delivered soon (announcement of the 20min delivery timeframe), with tokens:
+- Delivery time has been announced (Picnic published the 20min delivery timeframe, usually several hours before the delivery itself), with tokens:
   - eta date
   - eta begin, returning the begin of the 20 minutes delivery timeframe
   - eta end, returning the end of the 20 minutes delivery timeframe
-- Start of the time frame when the delivery is announced
-- End of the time frame when the delivery is announced
-- Your groceries have been delivered
+- Your groceries will be delivered soon, a configurable number of minutes (30 by default) before the delivery timeframe starts, with the same tokens
+- Start of the time frame when the delivery is announced, with the same tokens
+- End of the time frame when the delivery is announced, with the same tokens
+- Your groceries have been delivered, with tokens:
+  - eta date
+  - eta begin and eta end of the timeframe the delivery was expected in
+  - delivery time, the moment the groceries were actually delivered
 
 ## Flow Actions
 - Adding a product to your basket based on the name of the product passed as an argument.
