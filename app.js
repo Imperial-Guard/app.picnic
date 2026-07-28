@@ -5,6 +5,7 @@ const actions = require('./lib/actions.js');
 const conditions = require('./lib/conditions.js')
 const utils = require('./lib/utils.js');
 const { deriveOrderEvent } = require('./lib/orderevent.js');
+const eta = require('./lib/eta.js');
 
 var http = require("https");
 var md5 = require("md5");
@@ -137,15 +138,13 @@ class Picnic extends Homey.App {
 		}
 
 		if (this.homey.settings.get("delivery_eta_start") !== null) {
-			const delivery_eta_start = this.homey.settings.get("delivery_eta_start").replace(/T/, ' ').replace(/\..+/, '').split(' ')[1].slice(0, -3)
-			await this.orderDeliveryStartWindow.setValue(delivery_eta_start);
+			await this.orderDeliveryStartWindow.setValue(this.formatEtaTime(this.homey.settings.get("delivery_eta_start")));
 		} else {
 			await this.orderDeliveryStartWindow.setValue("")
 		}
 
 		if (this.homey.settings.get("delivery_eta_end") !== null) {
-			const delivery_eta_end = this.homey.settings.get("delivery_eta_end").replace(/T/, ' ').replace(/\..+/, '').split(' ')[1].slice(0, -3)
-			await this.orderDeliveryEndWindow.setValue(delivery_eta_end);
+			await this.orderDeliveryEndWindow.setValue(this.formatEtaTime(this.homey.settings.get("delivery_eta_end")));
 		} else {
 			await this.orderDeliveryEndWindow.setValue("")
 		}
@@ -209,6 +208,23 @@ class Picnic extends Homey.App {
 
 	}
 
+	formatEtaTime(iso) {
+		return eta.formatEtaTime(iso, this.homey.clock.getTimezone());
+	}
+
+	formatEtaDate(iso) {
+		return eta.formatEtaDate(iso, this.homey.clock.getTimezone());
+	}
+
+	// the token set every delivery window trigger hands to its flow
+	_etaTokens(eta_start, eta_end) {
+		return {
+			'eta_start': this.formatEtaTime(eta_start),
+			'eta_end': this.formatEtaTime(eta_end),
+			'eta_date': this.formatEtaDate(eta_start)
+		}
+	}
+
 	async pollOrder() {
 		return new Promise((resolve, reject) => {
 			if (this.homey.settings.getKeys().indexOf("x-picnic-auth") > -1 && this.homey.settings.getKeys().indexOf("username") > -1 && this.homey.settings.getKeys().indexOf("password") > -1) {
@@ -233,9 +249,9 @@ class Picnic extends Homey.App {
 						this.debug("Order_status has changed! Changing tokens, settings and firing the trigger accordingly.")
 						if (orderEvent["event"] == 'groceries_ordered') {
 							this.debug("Order changed to groceries_ordered, firing trigger")
-							const eta_start = orderEvent["eta1_start"].replace(/T/, ' ').replace(/\..+/, '').split(' ')[1].slice(0, -3)
-							const eta_end = orderEvent["eta1_end"].replace(/T/, ' ').replace(/\..+/, '').split(' ')[1].slice(0, -3)
-							const eta_date = orderEvent["eta1_start"].replace(/T/, ' ').replace(/\..+/, '').split(' ')[0]
+							const eta_start = this.formatEtaTime(orderEvent["eta1_start"])
+							const eta_end = this.formatEtaTime(orderEvent["eta1_end"])
+							const eta_date = this.formatEtaDate(orderEvent["eta1_start"])
 							const price = orderEvent["price"]
 
 							const data = { 'price': price, 'eta_start': eta_start, 'eta_end': eta_end, 'eta_date': eta_date }
@@ -259,23 +275,19 @@ class Picnic extends Homey.App {
 						}
 						else if (orderEvent["event"] == 'delivery_announced') {
 							this.debug("Order changed to delivery_announced, firing trigger")
-							const eta2_start = orderEvent["eta2_start"].replace(/T/, ' ').replace(/\..+/, '').split(' ')[1].slice(0, -3)
-							const eta2_end = orderEvent["eta2_end"].replace(/T/, ' ').replace(/\..+/, '').split(' ')[1].slice(0, -3)
-							const eta_date = orderEvent["eta2_start"].replace(/T/, ' ').replace(/\..+/, '').split(' ')[0]
+							const tokens = this._etaTokens(orderEvent["eta2_start"], orderEvent["eta2_end"])
 
-							const eta = { 'eta_start': eta2_start, 'eta_end': eta2_end, 'eta_date': eta_date }
-
-							this._deliveryAnnouncedTrigger.trigger(eta)
+							this._deliveryAnnouncedTrigger.trigger(tokens)
 
 							this.orderStatus.setValue("delivery_announced")
-							this.orderDeliveryDate.setValue(eta_date)
-							this.orderDeliveryStartWindow.setValue(eta2_start)
-							this.orderDeliveryEndWindow.setValue(eta2_end)
+							this.orderDeliveryDate.setValue(tokens["eta_date"])
+							this.orderDeliveryStartWindow.setValue(tokens["eta_start"])
+							this.orderDeliveryEndWindow.setValue(tokens["eta_end"])
 
 							this.homey.settings.set("order_status", "delivery_announced")
 							this.homey.settings.set("delivery_eta_start", orderEvent["eta2_start"])
 							this.homey.settings.set("delivery_eta_end", orderEvent["eta2_end"])
-							this.homey.settings.set("delivery_date", eta_date)
+							this.homey.settings.set("delivery_date", tokens["eta_date"])
 
 							this.debug("30 minutes before delivery we will increase polling interval");
 							this.createDeliverySchedule(orderEvent["eta2_start"], orderEvent["eta2_end"]);
